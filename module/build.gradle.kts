@@ -15,6 +15,7 @@ val minKsuVersion: Int by rootProject.extra
 val minKsudVersion: Int by rootProject.extra
 val maxKsuVersion: Int by rootProject.extra
 val minMagiskVersion: Int by rootProject.extra
+val commitHash: String by rootProject.extra
 
 android.buildFeatures {
     androidResources = false
@@ -27,7 +28,7 @@ androidComponents.onVariants { variant ->
     val buildTypeLowered = variant.buildType?.toLowerCase()
 
     val moduleDir = "$buildDir/outputs/module/$variantLowered"
-    val zipFileName = "$moduleName-$verName-$verCode-$buildTypeLowered.zip".replace(' ', '-')
+    val zipFileName = "$moduleName-$verName-$verCode-$commitHash-$buildTypeLowered.zip".replace(' ', '-')
 
     val prepareModuleFilesTask = task<Sync>("prepareModuleFiles$variantCapped") {
         group = "module"
@@ -45,9 +46,9 @@ androidComponents.onVariants { variant ->
             include("module.prop")
             expand(
                 "moduleId" to moduleId,
-                "moduleName" to "$moduleName-$variantCapped",
-                "versionName" to "$verName ($verCode)-($variantCapped)",
-                "versionCode" to verCode,
+                "moduleName" to moduleName,
+                "versionName" to "$verName ($verCode-$commitHash-$variantLowered)",
+                "versionCode" to verCode
             )
         }
         from("$projectDir/src") {

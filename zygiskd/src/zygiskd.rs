@@ -1,32 +1,28 @@
-use crate::constants::DaemonSocketAction;
-use crate::utils::{UnixStreamExt};
-use crate::{constants, debug_select, lp_select, magic, root_impl, utils};
-use anyhow::{bail, ensure, Result};
-use memfd::Memfd;
-use nix::{
-    fcntl::{fcntl, FcntlArg, FdFlag},
-    libc::self,
-};
+use std::ffi::c_void;
+use crate::constants::{DaemonSocketAction, ProcessFlags};
+use crate::utils::UnixStreamExt;
+use crate::{constants, dl, lp_select, magic, root_impl, utils};
+use anyhow::{bail, Result};
 use passfd::FdPassingExt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::fs;
-use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::unix::{
     net::{UnixListener, UnixStream},
     prelude::AsRawFd,
 };
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, ForkResult};
+use nix::libc;
+use nix::sys::stat::fstat;
+use nix::unistd::close;
+
+type ZygiskCompanionEntryFn = unsafe extern "C" fn(i32);
 
 struct Module {
     name: String,
-    memfd: OwnedFd,
-    companion: Mutex<Option<UnixStream>>,
+    lib_fd: OwnedFd,
+    entry: Option<ZygiskCompanionEntryFn>,
 }
 
 struct Context {
@@ -86,8 +82,8 @@ fn load_modules(arch: &str) -> Result<Vec<Module>> {
             return Ok(modules);
         }
     };
-    for entry_result in dir.into_iter() {
-        let entry = entry_result?;
+    for entry in dir.into_iter() {
+        let entry = entry?;
         let name = entry.file_name().into_string().unwrap();
         let so_path = entry.path().join(format!("zygisk/{arch}.so"));
         let disabled = entry.path().join("disable");
@@ -95,15 +91,15 @@ fn load_modules(arch: &str) -> Result<Vec<Module>> {
             continue;
         }
         log::info!("  Loading module `{name}`...");
-        let fd = match create_library_fd(&so_path) {
+        let lib_fd = match create_library_fd(&so_path) {
             Ok(fd) => fd,
             Err(e) => {
                 log::warn!("  Failed to create memfd for `{name}`: {e}");
                 continue;
             }
         };
-        let companion = Mutex::new(None);
-        let module = Module { name, memfd: fd, companion };
+        let entry = resolve_module(&so_path.to_string_lossy())?;
+        let module = Module { name, lib_fd, entry };
         modules.push(module);
     }
 
@@ -143,40 +139,16 @@ fn create_daemon_socket() -> Result<UnixListener> {
     Ok(listener)
 }
 
-fn spawn_companion(name: &str, fd: &RawFd) -> Result<Option<UnixStream>> {
-    let (mut daemon, companion) = UnixStream::pair()?;
-    // Remove FD_CLOEXEC flag
-    fcntl(companion.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))?;
-
-    let process = std::env::args().next().unwrap();
-    let nice_name = process.split('/').last().unwrap();
-
-    match unsafe { fork()? } {
-        ForkResult::Parent { child, ..} => {
-            if let Ok(WaitStatus::Exited(.., code)) = waitpid(child, None) {
-                ensure!(code == 0, format!("process exited with {code}"));
-            } else {
-                bail!("process exited abnormally");
-            }
+fn resolve_module(path: &str) -> Result<Option<ZygiskCompanionEntryFn>> {
+    unsafe {
+        let handle = dl::dlopen(path, libc::RTLD_NOW)?;
+        let symbol = std::ffi::CString::new("zygisk_companion_entry")?;
+        let entry = libc::dlsym(handle, symbol.as_ptr());
+        if entry.is_null() {
+            return Ok(None);
         }
-        ForkResult::Child => {
-            Command::new(&process)
-                .arg0(format!("{}-{}", nice_name, name))
-                .arg("companion")
-                .arg(format!("{}", companion.as_raw_fd()))
-                .spawn()?;
-            drop(companion);
-
-            std::process::exit(0);
-        }
-    }
-
-    daemon.write_string(name)?;
-    daemon.send_fd(*fd)?;
-    match daemon.read_u8()? {
-        0 => Ok(None),
-        1 => Ok(Some(daemon)),
-        _ => bail!("Invalid companion response"),
+        let fnptr = std::mem::transmute::<*mut c_void, ZygiskCompanionEntryFn>(entry);
+        Ok(Some(fnptr))
     }
 }
 
@@ -204,64 +176,51 @@ fn handle_daemon_action(mut stream: UnixStream, context: &Context) -> Result<()>
         }
         DaemonSocketAction::GetProcessFlags => {
             let uid = stream.read_u32()? as i32;
-            let mut flags = 0u32;
-            if root_impl::uid_on_allowlist(uid) {
-                flags |= constants::PROCESS_GRANTED_ROOT;
+            let mut flags = ProcessFlags::empty();
+            if root_impl::uid_granted_root(uid) {
+                flags |= ProcessFlags::PROCESS_GRANTED_ROOT;
             }
-            if root_impl::uid_on_denylist(uid) {
-                flags |= constants::PROCESS_ON_DENYLIST;
+            if root_impl::uid_should_umount(uid) {
+                flags |= ProcessFlags::PROCESS_ON_DENYLIST;
             }
             match root_impl::get_impl() {
-                root_impl::RootImpl::KernelSU => flags |= constants::PROCESS_ROOT_IS_KSU,
-                root_impl::RootImpl::Magisk => flags |= constants::PROCESS_ROOT_IS_MAGISK,
+                root_impl::RootImpl::KernelSU => flags |= ProcessFlags::PROCESS_ROOT_IS_KSU,
+                root_impl::RootImpl::Magisk => flags |= ProcessFlags::PROCESS_ROOT_IS_MAGISK,
                 _ => unreachable!(),
             }
-            // TODO: PROCESS_IS_SYSUI?
-            stream.write_u32(flags)?;
+            log::trace!("Uid {} granted root: {}", uid, flags.contains(ProcessFlags::PROCESS_GRANTED_ROOT));
+            log::trace!("Uid {} on denylist: {}", uid, flags.contains(ProcessFlags::PROCESS_ON_DENYLIST));
+            stream.write_u32(flags.bits())?;
         }
         DaemonSocketAction::ReadModules => {
             stream.write_usize(context.modules.len())?;
             for module in context.modules.iter() {
                 stream.write_string(&module.name)?;
-                stream.send_fd(module.memfd.as_raw_fd())?;
+                stream.send_fd(module.lib_fd.as_raw_fd())?;
             }
         }
         DaemonSocketAction::RequestCompanionSocket => {
             let index = stream.read_usize()?;
             let module = &context.modules[index];
-            let name = &module.name;
-            let fd = &module.memfd;
-            let mut companion = module.companion.lock().unwrap();
-            if let Some(sock) = companion.as_ref() {
-                let mut pfds = [PollFd::new(sock.as_raw_fd(), PollFlags::empty())];
-                poll(&mut pfds, 0)?;
-                if !pfds[0].revents().unwrap().is_empty() {
-                    log::error!("poll companion for module `{}` crashed", name);
-                    companion.take();
-                }
-            }
-            if companion.as_ref().is_none() {
-                match spawn_companion(&name, &fd.as_raw_fd()) {
-                    Ok(c) => {
-                        log::trace!("  spawned companion for `{name}`");
-                        *companion = c;
-                    },
-                    Err(e) => {
-                        log::warn!("  Failed to spawn companion for `{name}`: {e}");
-                    }
-                };
-            }
-            match companion.as_ref() {
-                Some(sock) => {
-                    if let Err(_) = sock.send_fd(stream.as_raw_fd()) {
-                        log::error!("Companion socket of module `{}` missing", module.name);
-
-                        stream.write_u8(0)?;
-                    }
-                    // Ok: Send by companion
-                }
+            match module.entry {
                 None => {
                     stream.write_u8(0)?;
+                    return Ok(());
+                }
+                Some(companion) => {
+                    stream.write_u8(1)?;
+                    let fd = stream.into_raw_fd();
+                    let st0 = fstat(fd)?;
+                    unsafe { companion(fd); }
+                    // Only close client if it is the same file so we don't
+                    // accidentally close a re-used file descriptor.
+                    // This check is required because the module companion
+                    // handler could've closed the file descriptor already.
+                    if let Ok(st1) = fstat(fd) {
+                        if st0.st_dev == st1.st_dev && st0.st_ino == st1.st_ino {
+                            close(fd)?;
+                        }
+                    }
                 }
             }
         }
